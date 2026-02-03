@@ -46,7 +46,6 @@ class PageTable:
         return self.map.get(logical_id)
 
 
-@dataclass
 class Sequence:
     """
     tokens: prompt + generated tokens. We keep a page table mapping and logical pages list
