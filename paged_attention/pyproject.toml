@@ -1,0 +1,13 @@
+[project]
+name = "Paged Attention LLM Optimizations"
+version = "0.1.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "~3.12"
