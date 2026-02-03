@@ -5,8 +5,6 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 
 import torch
-import torch.nn.functional as F
-from transformers.utils.fx import torch_cat
 
 
 @dataclass
@@ -80,6 +78,7 @@ class Sequence:
 
     def set_kv_at(self, token_index: int, k: torch.Tensor, v: torch.Tensor):
         """
+        :param token_index:
         :param k: (num_heads, head_dim)
         :param v:(num_heads, head_dim)
         :return: Writes KV for the token at the right page/offset
@@ -164,32 +163,27 @@ class PagedAttention:
         self.head_dim = head_dim
         self.scale = 1.0 / math.sqrt(head_dim)
 
-    @torch.no_grad
+    @torch.no_grad()
     def forward(
             self,
             query: torch.Tensor,
             sequence: Sequence,
             query_start_pos: Optional[int] = None,
     ) -> torch.Tensor:
+
         assert query.ndim == 3, "query must be (Tq, H, D)"
         Tq, H, D = query.shape
         assert H == self.num_heads and D == self.head_dim
 
-        Tkv = sequence.get_num_tokens() # How many tokens exist in the sequence so far, whose K/V are in the cache?
+        Tkv = sequence.get_num_tokens() # this checks how many tokens exist in the sequence so far, whose K/V are in the cache?
         if query_start_pos is None:
             query_start_pos = Tkv - Tq
         assert 0<= query_start_pos <= Tkv - Tq
 
-        k_blocks, v_blocks = [], []
-        for logical_id in sequence.logical_pages:
-            page = sequence.page_table.get_page(logical_id)
-            k_blocks.append(page.kv[0])
-            v_blocks.append(page.kv[1])
-
         # streaming softmax state per (Tq, H)
-        m = torch.full((Tq, H), -float("inf"), device=query.device, dtype = query.dtype)
-        l = torch.zeros((Tq, H), device=query.device, dtype = query.dtype)
-        out = torch.zeros((Tq, H, D), device=query.device, dtype=query.dtype)
+        m = torch.full((Tq, H), -float("inf"), device=query.device, dtype = query.dtype) # running max
+        l = torch.zeros((Tq, H), device=query.device, dtype = query.dtype) # running sum exp
+        out = torch.zeros((Tq, H, D), device=query.device, dtype=query.dtype) # running weighted sum
 
         # Absolute position for each query token
         q_pos = torch.arange(query_start_pos, query_start_pos + Tq, device=query.device)
@@ -210,67 +204,68 @@ class PagedAttention:
             K = page.kv[0, :valid_len].to(query.device, query.dtype)  # (Tk, H, D)
             V = page.kv[1, :valid_len].to(query.device, query.dtype) # (Tk, H, D)
 
+            K_h = K.permute(1, 0, 2) # (H, Tk, D)
+            V_h = V.permute(1, 0, 2) # (H, Tk, D)
 
+            # scores: (Tq, H, Tk)
+            scores = torch.einsum("thd,hkd->thk", query, K_h) * self.scale
 
-        # keys = torch.cat(k_blocks, dim=0) # (tokens, num_head, head_dim)
-        # values = torch.cat(v_blocks, dim=0)
-        #
-        # num_tokens = sequence.get_num_tokens()
-        # keys = keys[:num_tokens].transpose(0,1)
-        # values = values[:num_tokens].transpose(0,1)
-        #
-        # q = query.transpose(0,1)
-        # attention_score = torch.matmul(q, keys.transpose(1,2 )) * self.scale
-        # attention_weights = F.softmax(attention_score, dim=-1)
-        # output = torch.matmul(attention_weights, values)
-        #
-        # return output.transpose(0,1)
+            # causal mask: key_pos <= query_pos
+            k_pos = torch.arange(page_start, page_start+valid_len, device=query.device)
+            causal = (k_pos[None, :] <= q_pos[:, None])
+            scores = scores.masked_fill(~causal[:, None, :], -float("inf")) # setting - infinity for future tokens
+
+            #streaming softmax update
+            scores_max = scores.max(dim=-1).values
+            new_m = torch.maximum(m, scores_max)
+            exp_scores = torch.exp(scores - new_m[..., None])
+            exp_m = torch.exp(m - new_m)
+
+            new_l = l * exp_m + exp_scores.sum(dim=-1)
+            weighted = torch.einsum("thk,hkd->thd", exp_scores, V_h)
+            new_out = out * exp_m[..., None] + weighted
+
+            m, l, out = new_m, new_l, new_out
+
+        l = torch.clamp(l, min=1e-9)
+        return out / l[..., None] #normalized ie numerator = weighted sum of values and denominator = sum of weights as we calculate softmax
+
 
 
 if __name__ == "__main__":
-    config = Config(num_head=8, head_dim=64, page_size=16)
-    block_manager = BlockManager(num_pages=10, page_size=config.page_size)
-    
-    print(f"Initialized block manager with {len(block_manager.pages)} pages")
-    print(f"Page size: {config.page_size} tokens per page")
-    
-    prompt_tokens = list(range(50))
-    seq1 = Sequence(seq_id=1, prompt_tokens=prompt_tokens, page_size=config.page_size)
-    
-    print(f"\n {seq1}")
-    print(f"tokens: {seq1.get_num_tokens()}")
-    print(f"pages needed: {seq1.get_num_pages_needed()}")
+    torch.manual_seed(0)
 
-    print(f"=======PREFILL PHASE======")
-    success = block_manager.allocate_for_sequence(seq1)
-    print(f"allocation successful: {success}")
-    print(f"logical phase: {seq1.logical_pages}")
-    print(f"page table: {seq1.page_table}")
-    print(f"Free pages remaining: {block_manager.get_num_free_pages()}")
+    cfg = Config(num_heads=8, head_dim=64, num_pages=10, page_size=16)
+    bm = BlockManager(cfg.num_pages, cfg.page_size, cfg.num_heads, cfg.head_dim)
+    
+    prompt_tokens = list(range(20))
+    seq = Sequence(seq_id=1, prompt_tokens=prompt_tokens, page_size=cfg.page_size)
 
-    print(f"=======DECODE PHASE======")
+    # Allocate for prefill
+    ok = bm.allocate_for_sequence(seq)
+    print(f"Prefill allocation ok: {ok} | {seq}")
+
+    # Write KV for all prompt tokens
+    for t in range(seq.get_num_tokens()):
+        k = torch.randn(cfg.num_heads, cfg.head_dim)
+        v = torch.randn(cfg.num_heads, cfg.head_dim)
+        seq.set_kv_at(t, k, v)
+
+    # Decode: append tokens and write KV per token
     for i in range(20):
-        new_token = 100 + i
-        seq1.append_tokens(new_token)
+        seq.append_tokens(100 + i)
+        ok = bm.allocate_for_sequence(seq)
+        assert ok, "out of pages"
 
-        pages_needed = seq1.get_num_pages_needed()
-        if pages_needed > len(seq1.logical_pages):
-            print(f"\ntoken {i + 1}: need new page (total tokens: {seq1.get_num_tokens()})")
-            success = block_manager.allocate_for_sequence(seq1)
-            print(f"allocated page {seq1.logical_pages[-1]}")
-        else:
-            print(f"token {i + 1}: using existing pages (total tokens: {seq1.get_num_tokens()})")
+        t = seq.get_num_tokens()-1
+        k = torch.randn(cfg.num_heads, cfg.head_dim)
+        v = torch.randn(cfg.num_heads, cfg.head_dim)
+        seq.set_kv_at(t, k, v)
 
-    print(f"\nfinal sequence state: {seq1}")
-    print(f"free pages: {block_manager.get_num_free_pages()}")
+    print("after decode:", seq, "| free_pages:", bm.get_num_free_pages())
 
-    pa = PagedAttention(config.num_head, config.head_dim)
-    mock_query = torch.randn(1, config.num_head, config.head_dim)
-
-    for log_id in seq1.logical_pages:
-        page = seq1.page_table.get_page(log_id)
-        page.kv.uniform_(-1, 1)
-
-    attention_output = pa.forward(mock_query, seq1)
+    pa = PagedAttention(cfg.num_heads, cfg.head_dim)
+    q = torch.randn(1, cfg.num_heads, cfg.head_dim)
+    attention_output = pa.forward(q, seq)
     print(f"\n Paged Attention output shape is {attention_output.shape}")
     
